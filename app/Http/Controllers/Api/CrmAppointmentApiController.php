@@ -3,6 +3,7 @@
 namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
+use App\Models\Admin;
 use App\Models\Appointment;
 use App\Models\NatureOfEnquiry;
 use App\Support\BookingTimeSlots;
@@ -11,6 +12,7 @@ use App\Support\CrmAppointmentPresenter;
 use Carbon\Carbon;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Validator;
 use Illuminate\Support\Str;
@@ -313,10 +315,19 @@ class CrmAppointmentApiController extends Controller
         $status = $isPaid ? 10 : 1;
 
         try {
+            DB::beginTransaction();
+
+            $fullName = trim((string) $validated['full_name']);
+            $email = trim((string) $validated['email']);
+            $phone = trim((string) ($validated['phone'] ?? ''));
+            [$clientId, $clientUniqueId] = $this->resolveWebsiteClient($fullName, $email, $phone);
+
             $appointment = new Appointment;
-            $appointment->full_name = trim((string) $validated['full_name']);
-            $appointment->email = trim((string) $validated['email']);
-            $appointment->phone = trim((string) ($validated['phone'] ?? ''));
+            $appointment->client_id = $clientId;
+            $appointment->client_unique_id = $clientUniqueId;
+            $appointment->full_name = $fullName;
+            $appointment->email = $email;
+            $appointment->phone = $phone;
             $appointment->date = $dateYmd;
             $appointment->time = $parsedTime['storage'];
             $appointment->timeslot_full = $parsedTime['label'].' - '.$endLabel;
@@ -331,7 +342,10 @@ class CrmAppointmentApiController extends Controller
             $appointment->invites = 0;
             $appointment->title = null;
             $appointment->save();
+
+            DB::commit();
         } catch (\Throwable $e) {
+            DB::rollBack();
             Log::error('CRM add-appointment failed', [
                 'message' => $e->getMessage(),
             ]);
@@ -442,6 +456,58 @@ class CrmAppointmentApiController extends Controller
             'message' => 'Appointment updated successfully.',
             'data' => CrmAppointmentPresenter::toArray($appointment),
         ]);
+    }
+
+    /**
+     * Match website admins by email, then phone (same table as public booking).
+     * Create a website client when neither matches. Same unique-code pattern as AppointmentBookController.
+     *
+     * @return array{0: int, 1: string|null}
+     */
+    private function resolveWebsiteClient(string $fullName, string $email, string $phone): array
+    {
+        $user = null;
+        if ($email !== '') {
+            $user = Admin::query()->where('email', $email)->first();
+        }
+        if (! $user && $phone !== '') {
+            $user = Admin::query()->where('phone', $phone)->first();
+        }
+
+        $prefix = strlen($fullName) >= 4
+            ? trim(substr($fullName, 0, 4))
+            : trim($fullName);
+        if ($prefix === '') {
+            $prefix = 'CLNT';
+        }
+
+        if ($user) {
+            if (empty($user->client_id)) {
+                $user->client_id = $this->makeWebsiteClientUniqueId($prefix);
+                $user->save();
+            }
+
+            return [(int) $user->id, $user->client_id];
+        }
+
+        $client = new Admin;
+        $client->client_id = $this->makeWebsiteClientUniqueId($prefix);
+        $client->first_name = $fullName;
+        $client->last_name = '';
+        $client->email = $email;
+        $client->phone = $phone !== '' ? $phone : null;
+        $client->save();
+
+        return [(int) $client->id, $client->client_id];
+    }
+
+    private function makeWebsiteClientUniqueId(string $prefix): string
+    {
+        do {
+            $unique = strtoupper($prefix).date('his').(string) random_int(10, 99);
+        } while (Admin::query()->where('client_id', $unique)->exists());
+
+        return $unique;
     }
 
     /**
